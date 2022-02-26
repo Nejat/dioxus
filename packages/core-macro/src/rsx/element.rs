@@ -1,11 +1,10 @@
-use super::*;
+use std::mem::take;
+use proc_macro2::{TokenStream as TokenStream2, TokenStream};
+use proc_macro_error::abort_call_site;
+use quote::{quote, TokenStreamExt, ToTokens};
+use syn::{braced, bracketed, Expr, Ident, LitStr, parenthesized, parse::{Parse, ParseBuffer, ParseStream}, Result, Token, token};
 
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, ToTokens, TokenStreamExt};
-use syn::{
-    parse::{Parse, ParseBuffer, ParseStream},
-    Expr, Ident, LitStr, Result, Token,
-};
+use super::*;
 
 // =======================================
 // Parse the VNode::Element type
@@ -70,6 +69,45 @@ impl Parse for Element {
                         "This attribute is missing a trailing comma"
                     )
                 }
+                continue;
+            }
+
+            if content.peek(Ident) && content.peek2(Token![!]) {
+                let macro_name = content.parse::<Ident>()?;
+
+                content.parse::<Token![!]>()?;
+
+                let macro_content;
+
+                if content.peek(token::Paren) {
+                    parenthesized!(macro_content in content);
+                } else if content.peek(token::Bracket) {
+                    bracketed!(macro_content in content);
+                } else if content.peek(token::Brace) {
+                    braced!(macro_content in content);
+                } else {
+                    abort_call_site!(format!("'{macro_name}' is an invalid macro invocation"))
+                }
+
+                let macro_type = MacroType::try_from(macro_content.parse::<Ident>()?)?;
+
+                macro_content.parse::<token::FatArrow>()?;
+
+                let macro_expr = macro_content.parse::<TokenStream>()?;
+
+                if !macro_content.is_empty() {
+                    abort_call_site!(format!("Unexpected macro content: {macro_content}"));
+                }
+
+                attributes.push(ElementAttrNamed {
+                    el_name: el_name.clone(),
+                    attr: ElementAttr::Macro { name: macro_name, macro_type, macro_expr },
+                });
+
+                if content.is_empty() {
+                    break;
+                }
+
                 continue;
             }
 
@@ -201,20 +239,60 @@ impl ToTokens for Element {
             .iter()
             .filter(|f| matches!(f.attr, ElementAttr::EventTokens { .. }));
 
+        let macro_listeners = self
+            .attributes
+            .iter()
+            .filter(|f| matches!(f.attr, ElementAttr::Macro { macro_type, .. } if macro_type == MacroType::Listeners))
+            .take(1)
+            .next();
+
         let attr = self
             .attributes
             .iter()
-            .filter(|f| !matches!(f.attr, ElementAttr::EventTokens { .. }));
+            .filter(|f| !matches!(f.attr, ElementAttr::EventTokens { .. }) && !matches!(f.attr, ElementAttr::Macro { .. }));
 
-        tokens.append_all(quote! {
+        let macro_attr = self
+            .attributes
+            .iter()
+            .filter(|f| matches!(f.attr, ElementAttr::Macro { macro_type, .. } if macro_type == MacroType::Attributes));
+
+        // __cx.bump().alloc(#macro_attr), // this came close, but would have needed to incorporate #(#attr),* was creating unnecessary extra outer brackets
+
+        let elements = quote! {
             __cx.element(
                 dioxus_elements::#name,
-                __cx.bump().alloc([ #(#listeners),* ]),
-                __cx.bump().alloc([ #(#attr),* ]),
+                __cx.bump().alloc([ #(#listeners),* #(#macro_listeners)* ]),
+                __cx.bump().alloc([ #(#attr),* #(#macro_attr)* ]),
                 __cx.bump().alloc([ #(#children),* ]),
                 #key,
             )
-        });
+        };
+
+        // println!("\nDIOXUS: {elements}\n");
+
+        tokens.append_all(elements);
+    }
+}
+
+///
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum MacroType {
+    /// macro generates listeners
+    Listeners,
+
+    /// macro generates attributes
+    Attributes,
+}
+
+impl TryFrom<Ident> for MacroType {
+    type Error = syn::Error;
+
+    fn try_from(value: Ident) -> std::result::Result<Self, Self::Error> {
+        match value.to_string().as_str() {
+            "events" => Ok(Self::Listeners),
+            "attributes" => Ok(Self::Attributes),
+            unsupported => Err(Self::Error::new_spanned(value, format!("{unsupported:?} is not a supported macro plugin type")))
+        }
     }
 }
 
@@ -235,6 +313,9 @@ pub enum ElementAttr {
     // EventClosure { name: Ident, closure: ExprClosure },
     /// onclick: {}
     EventTokens { name: Ident, tokens: Expr },
+
+    ///
+    Macro { name: Ident, macro_type: MacroType, macro_expr: TokenStream },
 }
 
 pub struct ElementAttrNamed {
@@ -275,6 +356,20 @@ impl ToTokens for ElementAttrNamed {
             ElementAttr::EventTokens { name, tokens } => {
                 quote! {
                     dioxus_elements::on::#name(__cx, #tokens)
+                }
+            }
+            ElementAttr::Macro { name: macro_name, macro_type, macro_expr } => {
+                match macro_type {
+                    MacroType::Listeners => {
+                        quote! {
+                            #macro_name! ( #macro_expr )
+                        }
+                    }
+                    MacroType::Attributes => {
+                        quote! {
+                            #macro_name! ( #el_name; #macro_expr )
+                        }
+                    }
                 }
             }
         });
