@@ -1,6 +1,7 @@
 use super::*;
 
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro_error::abort_call_site;
 use quote::{quote, ToTokens, TokenStreamExt};
 use syn::{
     parse::{Parse, ParseBuffer, ParseStream},
@@ -12,8 +13,10 @@ use syn::{
 // =======================================
 pub struct Element {
     pub name: Ident,
+    pub context: Option<CustomContext>,
     pub key: Option<LitStr>,
     pub attributes: Vec<ElementAttrNamed>,
+    pub parent: Option<Ident>,
     pub children: Vec<BodyNode>,
     pub _is_static: bool,
 }
@@ -179,9 +182,11 @@ impl Parse for Element {
         Ok(Self {
             key,
             name: el_name,
+            context: None,
             attributes,
             children,
             _is_static: false,
+            parent: None,
         })
     }
 }
@@ -206,11 +211,25 @@ impl ToTokens for Element {
             .iter()
             .filter(|f| !matches!(f.attr, ElementAttr::EventTokens { .. }));
 
+        let selector = match &self.parent {
+            Some(parent) => Ident::new(&format!("{parent}_{name}"), Span::call_site()),
+            None => name.clone()
+        };
+        let context = self.context.as_ref().map(|cx| &cx.name);
+        let context_type = match self.context.as_ref().map(|cx| &cx.cx_type) {
+            Some(Some(cx_type)) => cx_type.to_string().to_lowercase(),
+            _ => abort_call_site!("Custom context requires a type, i.e. rsx! { cx: MyProps; div { ... }")
+        };
+        let macro_name = Ident::new(&format!("{}_inject_element_listeners", context_type), Span::call_site());
+        let listeners = quote! { #macro_name!(#selector => __cx, #context, #(#listeners),*) };
+        let macro_name = Ident::new(&format!("{}_inject_element_attributes", context_type), Span::call_site());
+        let attr = quote! { #macro_name!(#selector => __cx, #context, #(#attr),*) };
+
         tokens.append_all(quote! {
             __cx.element(
                 dioxus_elements::#name,
-                __cx.bump().alloc([ #(#listeners),* ]),
-                __cx.bump().alloc([ #(#attr),* ]),
+                __cx.bump().alloc(#listeners),
+                __cx.bump().alloc(#attr),
                 __cx.bump().alloc([ #(#children),* ]),
                 #key,
             )

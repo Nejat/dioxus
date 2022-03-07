@@ -31,6 +31,7 @@ pub fn impl_my_derive(ast: &syn::DeriveInput) -> Result<TokenStream, Error> {
                     .map(|f| struct_info.required_field_impl(f))
                     .collect::<Result<Vec<_>, _>>()?;
                 let build_method = struct_info.build_method_impl();
+                let injection_macros = struct_info.build_injection_macros();
 
                 quote! {
                     #builder_creation
@@ -38,6 +39,7 @@ pub fn impl_my_derive(ast: &syn::DeriveInput) -> Result<TokenStream, Error> {
                     #( #fields )*
                     #( #required_fields )*
                     #build_method
+                    #injection_macros
                 }
             }
             syn::Fields::Unnamed(_) => {
@@ -169,8 +171,9 @@ mod util {
 }
 
 mod field_info {
-    use proc_macro2::TokenStream;
+    use proc_macro2::{Ident, Span, TokenStream};
     use quote::quote;
+    use syn::Expr;
     use syn::parse::Error;
     use syn::spanned::Spanned;
 
@@ -271,6 +274,8 @@ mod field_info {
         pub skip: bool,
         pub auto_into: bool,
         pub strip_option: bool,
+        pub attr_on: Option<Vec<Ident>>,
+        pub hndlr_on: Option<Vec<Ident>>,
     }
 
     impl FieldBuilderAttr {
@@ -347,6 +352,34 @@ mod field_info {
                             }
                             Ok(())
                         }
+                        // simple tag selector for applying attribute to inner element/component
+                        "attribute_on" => {
+                            if self.hndlr_on.is_some() {
+                                Err(Error::new_spanned(assign, r#""handler_on" already defined, can only apply one"#))
+                            } else {
+                                self.attr_on = FieldBuilderAttr::parse_simple_tag_selector(&assign.right)?;
+
+                                if self.attr_on.is_none() {
+                                    Err(Error::new_spanned(assign, r#""attribute_on" can not be empty, provide a selector or remove definition"#))
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        },
+                        // simple tag selector for applying event handler to inner element/component
+                        "handler_on" =>  {
+                            if self.attr_on.is_some() {
+                                Err(Error::new_spanned(assign, r#""attribute_on" already defined, can only apply one"#))
+                            } else {
+                                self.hndlr_on = FieldBuilderAttr::parse_simple_tag_selector(&assign.right)?;
+
+                                if self.hndlr_on.is_none() {
+                                    Err(Error::new_spanned(assign, r#""handler_on" can not be empty, provide a selector or remove definition"#))
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        },
                         _ => Err(Error::new_spanned(
                             &assign,
                             format!("Unknown parameter {:?}", name),
@@ -443,11 +476,43 @@ mod field_info {
                 _ => Err(Error::new_spanned(expr, "Expected (<...>=<...>)")),
             }
         }
+
+        fn parse_simple_tag_selector(assign_right: &Box<Expr>) -> Result<Option<Vec<Ident>>, Error> {
+            if let syn::Expr::Lit(syn::ExprLit {
+                                      lit: syn::Lit::Str(attr_on),
+                                      ..
+                                  }) = &**assign_right
+            {
+                // todo: validate selector; no dupes, only valid dom tags, valid component names, only > selection divider, etc.
+
+                let parsed = attr_on.token().to_string().trim_matches('\"').split(';')
+                    .filter(|sel| !sel.trim().is_empty())
+                    .map(|sel| {
+                        let sel = sel.split(' ')
+                            .filter_map(|sel| {
+                                let sel = sel.trim();
+
+                                if sel.is_empty() { None } else { Some(sel) }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("_");
+
+                        Ident::new(&sel, Span::call_site())
+                    })
+                    .collect::<Vec<_>>();
+
+                Ok(if parsed.is_empty() { None } else { Some(parsed) })
+            } else {
+                return Err(Error::new_spanned(assign_right, "Expected one or more semicolon separated Simple Tag Selector definitions, i.e. div > a, etc."));
+            }
+        }
     }
 }
 
 mod struct_info {
-    use proc_macro2::TokenStream;
+    use std::collections::HashMap;
+
+    use proc_macro2::{Ident, Span, TokenStream};
     use quote::quote;
     use syn::parse::Error;
 
@@ -456,6 +521,9 @@ mod struct_info {
         empty_type, empty_type_tuple, expr_to_single_string, make_punctuated_single,
         modify_types_generics_hack, path_to_single_string, strip_raw_ident_prefix, type_tuple,
     };
+
+    type ElementFields<'a> = (&'a Ident, Vec<&'a FieldInfo<'a>>);
+    type InjectionDefinition<'a> = fn(&'a FieldInfo) -> &'a Option<Vec<Ident>>;
 
     #[derive(Debug)]
     pub struct StructInfo<'a> {
@@ -652,7 +720,6 @@ Finally, call `.build()` to create the instance of `{name}`.
                         #can_memoize
                     }
                 }
-
             })
         }
 
@@ -934,6 +1001,133 @@ Finally, call `.build()` to create the instance of `{name}`.
                     }
                 }
             })
+        }
+
+        pub fn build_injection_macros(&'a self) -> TokenStream {
+            let cx_name = self.name.to_string().to_lowercase();
+
+            let injection_macros = [
+                // element attribute injection macro
+                self.build_element_attr_macro(
+                    &cx_name,
+                    self.build_injection_macro(
+                        |field| &field.builder_attr.attr_on,
+                        Self::build_element_attr_macro_branch,
+                    )
+                ),
+
+                // element listener injection macro
+                self.build_element_hndlr_macro(
+                    &cx_name,
+                    self.build_injection_macro(
+                        |field| &field.builder_attr.hndlr_on,
+                        Self::build_element_hndlr_macro_branch,
+                    )
+                ),
+            ];
+
+            quote! {
+                #(
+                    #[allow(unused_macros)]
+                    #injection_macros
+                )*
+            }
+        }
+
+        fn build_element_attr_macro(&self, cx_name: &str, branches: impl Iterator<Item=TokenStream>) -> TokenStream {
+            let macro_name = Ident::new(&format!("{cx_name}_inject_element_attributes"), Span::call_site());
+
+            quote! {
+                macro_rules! #macro_name {
+                    #(#branches)*
+                    ($invoke:ident => $node_factory:ident, $cx:ident, $($expr:expr),*) => {
+                        [$($expr,)*]
+                    };
+                    (.*) => {
+                        abort_call_site!("When injecting attributes, you must provide a context with the rsx! macro invocation, i.e. rsx!{ cx: MyProps; div { ... } }")
+                    };
+                }
+            }
+        }
+
+        fn build_element_attr_macro_branch((selector, fields): ElementFields<'a>) -> TokenStream {
+            let injected = fields.into_iter()
+                .map(|FieldInfo { name, builder_attr, .. }| {
+                    let fmt = if builder_attr.strip_option { "{:?}" } else { "{}" };
+                    let attr = name.to_string();
+
+                    quote! {
+                        $node_factory.attr( #attr, format_args_f!(#fmt, $cx.props.#name), None, false )
+                    }
+                });
+
+            quote! {
+                (#selector => $node_factory:ident, $cx:ident, $($expr:expr),*) => {
+                    [
+                        $($expr,)*
+                        #(#injected),*
+                    ]
+                };
+            }
+        }
+
+        fn build_element_hndlr_macro(&self, cx_name: &str, branches: impl Iterator<Item=TokenStream>) -> TokenStream {
+            let macro_name = Ident::new(&format!("{cx_name}_inject_element_listeners"), Span::call_site());
+
+            quote! {
+                macro_rules! #macro_name {
+                    #(#branches)*
+                    ($invoke:ident => $node_factory:ident, $cx:ident, $($expr:expr),*) => {
+                        [$($expr,)*]
+                    };
+                    (.*) => {
+                        abort_call_site!("When injecting listeners, you must provide a context with the rsx! macro invocation, i.e. rsx!{ cx: MyProps; div { ... } }")
+                    };
+                }
+            }
+        }
+
+        fn build_element_hndlr_macro_branch((selector, fields): ElementFields<'a>) -> TokenStream {
+            let injected = fields.into_iter()
+                .map(|FieldInfo { name, .. }| {
+                    quote! {
+                        dioxus_elements::on::#name($node_factory, move |evt| $cx.props.#name.call(evt))
+                    }
+                });
+
+            quote! {
+                (#selector => $node_factory:ident, $cx:ident, $($expr:expr),*) => {
+                    [
+                        $($expr,)*
+                        #(#injected),*
+                    ]
+                };
+            }
+        }
+
+        fn build_injection_macro(
+            &'a self,
+            injector_definition: InjectionDefinition<'a>,
+            macro_branch: impl Fn(ElementFields<'a>) -> TokenStream + 'a,
+        ) -> impl Iterator<Item=TokenStream>  + 'a {
+            self.included_fields()
+                // only use fields that have injection defined
+                .filter(|fld| injector_definition(fld).is_some())
+                // couple each field with a selector
+                .flat_map(|fld| injector_definition(fld).as_ref().unwrap().iter().map(move |sel| (sel, fld)))
+                // group all fields by selector
+                .fold(
+                    HashMap::new(),
+                    |mut acc, (sel, hndlr)| {
+                        let fields = acc.entry(sel).or_insert(vec![]);
+
+                        fields.push(hndlr);
+
+                        acc
+                    }
+                ).into_iter()
+                // build macro branch for each selector that injects all fields for that selector
+                .map(macro_branch)
         }
 
         pub fn build_method_impl(&self) -> TokenStream {

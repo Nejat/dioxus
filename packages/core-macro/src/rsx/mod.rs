@@ -23,25 +23,41 @@ pub use element::*;
 pub use node::*;
 
 // imports
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, ToTokens, TokenStreamExt};
 use syn::{
     parse::{Parse, ParseStream},
-    Ident, Result, Token,
+    Ident, Result, Token
 };
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CustomContext {
+    pub name: Ident,
+    pub cx_type: Option<Ident>,
+}
+
 pub struct CallBody {
-    pub custom_context: Option<Ident>,
+    pub custom_context: Option<CustomContext>,
     pub roots: Vec<BodyNode>,
 }
 
 impl Parse for CallBody {
     fn parse(input: ParseStream) -> Result<Self> {
-        let custom_context = if input.peek(Ident) && input.peek2(Token![,]) {
+        let custom_context = if input.peek(Ident) &&
+            input.peek2(Token![:]) &&
+            input.peek3(Ident)
+        {
+            let name = input.parse::<Ident>()?;
+            input.parse::<Token![:]>()?;
+            let r#type = input.parse::<Ident>()?;
+            input.parse::<Token![;]>()?;
+
+            Some(CustomContext { name, cx_type: Some(r#type) })
+        } else if input.peek(Ident) && input.peek2(Token![,]) {
             let name = input.parse::<Ident>()?;
             input.parse::<Token![,]>()?;
 
-            Some(name)
+            Some(CustomContext { name, cx_type: None })
         } else {
             None
         };
@@ -58,6 +74,8 @@ impl Parse for CallBody {
             roots.push(node);
         }
 
+        Self::update_nodes(&mut roots, custom_context.clone())?;
+
         Ok(Self {
             custom_context,
             roots,
@@ -65,6 +83,38 @@ impl Parse for CallBody {
     }
 }
 
+impl CallBody {
+    fn update_nodes(nodes: &mut Vec<BodyNode>, context: Option<CustomContext>) -> Result<()> {
+        return update_nodes_impl(nodes, &context, None);
+
+        fn update_nodes_impl(
+            nodes: &mut Vec<BodyNode>, context: &Option<CustomContext>, parent: Option<Ident>
+        ) -> Result<()> {
+            for node in nodes {
+                match node {
+                    BodyNode::Element(element) => {
+                        let next_level = build_next_level(&parent, &element.name);
+
+                        element.parent = parent.clone();
+                        element.context = (*context).clone();
+
+                        update_nodes_impl(&mut element.children, context, Some(next_level))?;
+                    }
+                    _ => {}
+                }
+            }
+
+            return Ok(());
+
+            fn build_next_level(parent: &Option<Ident>, name: &Ident) -> Ident {
+                match parent {
+                    Some(parent) => Ident::new(&format!("{parent}_{}", name), Span::call_site()),
+                    None => name.clone()
+                }
+            }
+        }
+    }
+}
 /// Serialize the same way, regardless of flavor
 impl ToTokens for CallBody {
     fn to_tokens(&self, out_tokens: &mut TokenStream2) {
@@ -78,8 +128,8 @@ impl ToTokens for CallBody {
 
         match &self.custom_context {
             // The `in cx` pattern allows directly rendering
-            Some(ident) => out_tokens.append_all(quote! {
-                #ident.render(LazyNodes::new_some(move |__cx: NodeFactory| -> VNode {
+            Some(CustomContext { name, .. }) => out_tokens.append_all(quote! {
+                #name.render(LazyNodes::new_some(move |__cx: NodeFactory| -> VNode {
                     use dioxus_elements::{GlobalAttributes, SvgAttributes};
                     #inner
                 }))
