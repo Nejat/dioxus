@@ -24,7 +24,9 @@ use syn::{
 
 pub struct Component {
     pub name: syn::Path,
+    pub context: Option<CustomContext>,
     pub body: Vec<ComponentField>,
+    pub parent: Option<Ident>,
     pub children: Vec<BodyNode>,
     pub manual_props: Option<Expr>,
 }
@@ -65,7 +67,9 @@ impl Parse for Component {
 
         Ok(Self {
             name,
+            context: None,
             body,
+            parent: None,
             children,
             manual_props,
         })

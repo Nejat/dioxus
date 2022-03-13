@@ -27,7 +27,7 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, ToTokens, TokenStreamExt};
 use syn::{
     parse::{Parse, ParseStream},
-    Ident, Result, Token
+    Ident, Result, Token, Error
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -99,6 +99,17 @@ impl CallBody {
                         element.context = (*context).clone();
 
                         update_nodes_impl(&mut element.children, context, Some(next_level))?;
+                    }
+                    BodyNode::Component(component) => {
+                        let name = component.name.get_ident().ok_or_else(
+                            || Error::new(Span::call_site(), "Only identifier components support, using a path is invalid")
+                        )?;
+                        let next_level = build_next_level(&parent, &name);
+
+                        component.parent = parent.clone();
+                        component.context = (*context).clone();
+
+                        update_nodes_impl(&mut component.children, context, Some(next_level))?;
                     }
                     _ => {}
                 }

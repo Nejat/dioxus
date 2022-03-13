@@ -1024,6 +1024,24 @@ Finally, call `.build()` to create the instance of `{name}`.
                         Self::build_element_hndlr_macro_branch,
                     )
                 ),
+
+                // component attribute injection macro
+                // self.build_component_attr_macro(
+                //     &cx_name,
+                //     self.build_injection_macro(
+                //         |fld| &fld.builder_attr.attr_on,
+                //         Self::build_component_attr_macro_branch,
+                //     )
+                // ),
+
+                // component listener injection macro
+                // self.build_component_hndlr_macro(
+                //     &cx_name,
+                //     self.build_injection_macro(
+                //         |fld| &fld.builder_attr.hndlr_on,
+                //         Self::build_component_hndlr_macro_branch,
+                //     )
+                // ),
             ];
 
             quote! {
@@ -1031,6 +1049,77 @@ Finally, call `.build()` to create the instance of `{name}`.
                     #[allow(unused_macros)]
                     #injection_macros
                 )*
+            }
+        }
+
+        fn build_component_attr_macro(&self, cx_name: &str, branches: impl Iterator<Item=TokenStream>) -> TokenStream {
+            let macro_name = Ident::new(&format!("{cx_name}_inject_element_attributes"), Span::call_site());
+
+            quote! {
+                macro_rules! #macro_name {
+                    #(#branches)*
+                    ($invoke:ident, $nd_factory:ident, $cx:ident, $($expr:expr),*) => {
+                        [$($expr,)*]
+                    };
+                    (.*) => {
+                        abort_call_site!("When injecting attributes, you must provide a context with the rsx! macro invocation, i.e. rsx!{ cx: MyProps; div { ... } }")
+                    };
+                }
+            }
+        }
+
+        fn build_component_attr_macro_branch((selector, fields): ElementFields<'a>) -> TokenStream {
+            let injected = fields.into_iter()
+                .map(|FieldInfo { name, builder_attr, .. }| {
+                    let opt = if builder_attr.strip_option { "{:?}" } else { "{}" };
+                    let attr = format!("{name}");
+
+                    quote! {
+                        $nd_factory.attr(#attr, format_args_f!(#opt, $cx.props.#name), None, false)
+                    }
+                });
+
+            quote! {
+                (#selector, $nd_factory:ident, $cx:ident, $($expr:expr),*) => {
+                    [
+                        $($expr,)*
+                        #(#injected),*
+                    ]
+                };
+            }
+        }
+
+        fn build_component_hndlr_macro(&self, cx_name: &str, branches: impl Iterator<Item=TokenStream>) -> TokenStream {
+            let macro_name = Ident::new(&format!("{cx_name}_inject_element_listeners"), Span::call_site());
+
+            quote! {
+                macro_rules! #macro_name {
+                    #(#branches)*
+                    ($invoke:ident, $nd_factory:ident, $cx:ident, $($expr:expr),*) => {
+                        [$($expr,)*]
+                    };
+                    (.*) => {
+                        abort_call_site!("When injecting listeners, you must provide a context with the rsx! macro invocation, i.e. rsx!{ cx: MyProps; div { ... } }")
+                    };
+                }
+            }
+        }
+
+        fn build_component_hndlr_macro_branch((selector, fields): ElementFields<'a>) -> TokenStream {
+            let injected = fields.into_iter()
+                .map(|FieldInfo { name, .. }| {
+                    quote! {
+                        dioxus_elements::on::#name($nd_factory, move |evt| { $cx.props.#name.call(evt) })
+                    }
+                });
+
+            quote! {
+                (#selector, $nd_factory:ident, $cx:ident, $($expr:expr),*) => {
+                    [
+                        $($expr,)*
+                        #(#injected),*
+                    ]
+                };
             }
         }
 
